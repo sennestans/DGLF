@@ -36,6 +36,7 @@ constexpr Socket kInvalidSocket = -1;
 #endif
 
 #ifdef __APPLE__
+#include <mach-o/dyld.h>
 #include <sys/sysctl.h>
 #endif
 
@@ -49,6 +50,8 @@ constexpr std::uint16_t kWorkerPort = 39555;
 constexpr std::size_t kMaxFrame = 1024 * 1024;
 constexpr std::string_view kDiscover = "MESHLLM_DISCOVER_V1";
 constexpr std::string_view kAdvertise = "MESHLLM_WORKER_V1";
+constexpr std::string_view kRecommendedModelName = "Qwen3.5 0.8B (Q4_0, managed)";
+constexpr std::string_view kRecommendedModelRepo = "ggml-org/Qwen3.5-0.8B-GGUF:Q4_0";
 
 enum class Message : std::uint8_t {
     info = 1, list_models = 2, models = 3, select_model = 4, selected = 5,
@@ -66,6 +69,14 @@ struct WorkerInfo : NodeInfo {
     std::string address;
     std::uint16_t port{};
 };
+
+struct ModelOption {
+    std::string display_name;
+    std::string source;
+    bool from_hugging_face{};
+};
+
+fs::path g_executable_directory;
 
 void close_socket(Socket socket) {
     if (socket == kInvalidSocket) return;
@@ -171,6 +182,34 @@ std::string hostname() {
     return "Mac";
 }
 
+fs::path executable_directory(const char* argv0) {
+    std::error_code error;
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> path(size);
+    if (_NSGetExecutablePath(path.data(), &size) == 0) {
+        return fs::weakly_canonical(path.data(), error).parent_path();
+    }
+#endif
+    const fs::path path = argv0 ? argv0 : "meshllm";
+    return fs::weakly_canonical(fs::absolute(path, error), error).parent_path();
+}
+
+[[maybe_unused]] std::string find_llama_cli() {
+    if (const char* configured = std::getenv("MESHLLM_LLAMA_CLI")) return configured;
+
+    const fs::path installed_sibling = g_executable_directory / "llama-cli";
+    std::error_code error;
+    if (fs::is_regular_file(installed_sibling, error)) return installed_sibling.string();
+
+#ifdef MESHLLM_BUNDLED_LLAMA_CLI
+    if (fs::is_regular_file(MESHLLM_BUNDLED_LLAMA_CLI, error)) return MESHLLM_BUNDLED_LLAMA_CLI;
+#endif
+    // This fallback keeps custom builds with MESHLLM_BUNDLE_LLAMA_CPP=OFF useful.
+    return "llama-cli";
+}
+
 #ifdef __APPLE__
 std::string sysctl_string(const char* key) {
     std::size_t size = 0;
@@ -221,17 +260,48 @@ std::vector<fs::path> scan_models(const fs::path& directory) {
     return models;
 }
 
-std::string model_names(const std::vector<fs::path>& models) {
+std::vector<ModelOption> available_models(const fs::path& directory, bool include_managed_model) {
+    std::vector<ModelOption> result;
+    for (const auto& path : scan_models(directory)) {
+        result.push_back({path.filename().string(), path.string(), false});
+    }
+    if (include_managed_model) {
+        result.push_back({std::string(kRecommendedModelName), std::string(kRecommendedModelRepo), true});
+    }
+    return result;
+}
+
+std::string model_names(const std::vector<ModelOption>& models) {
     std::string result;
     for (const auto& model : models) {
         if (!result.empty()) result += '\n';
-        result += model.filename().string();
+        result += model.display_name;
     }
     return result;
 }
 
 #ifndef _WIN32
-bool generate_with_llama(Socket client, const fs::path& model, const std::string& prompt,
+[[maybe_unused]] bool download_recommended_model(const std::string& executable) {
+    const pid_t child = fork();
+    if (child == -1) return false;
+    if (child == 0) {
+        // Download progress and errors remain on stderr. Only the one-token
+        // warm-up response is hidden from the worker's setup screen.
+        const int null_fd = open("/dev/null", O_WRONLY);
+        if (null_fd >= 0) dup2(null_fd, STDOUT_FILENO);
+        std::vector<std::string> arguments{executable, "-hf", std::string(kRecommendedModelRepo),
+            "-p", "Ready", "-n", "1", "--no-display-prompt", "--no-warmup", "--no-mmproj"};
+        std::vector<char*> argv;
+        for (auto& argument : arguments) argv.push_back(argument.data());
+        argv.push_back(nullptr);
+        execvp(executable.c_str(), argv.data());
+        _exit(127);
+    }
+    int status = 0;
+    return waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+bool generate_with_llama(Socket client, const ModelOption& model, const std::string& prompt,
                          const std::string& executable, bool use_metal) {
     int output_pipe[2];
     if (pipe(output_pipe) != 0) return send_frame(client, Message::error, "Could not create llama.cpp output pipe.");
@@ -248,8 +318,14 @@ bool generate_with_llama(Socket client, const fs::path& model, const std::string
 
         // llama-cli is invoked directly (never through a shell). Its stdout pipe
         // naturally provides streaming chunks without coupling to llama.cpp APIs.
-        std::vector<std::string> arguments{executable, "-m", model.string(), "-p", prompt,
-            "-n", "512", "--simple-io", "--no-display-prompt", "--no-warmup"};
+        std::vector<std::string> arguments{executable};
+        if (model.from_hugging_face) {
+            arguments.insert(arguments.end(), {"-hf", model.source, "--no-mmproj"});
+        } else {
+            arguments.insert(arguments.end(), {"-m", model.source});
+        }
+        arguments.insert(arguments.end(), {"-p", prompt, "-n", "512", "--simple-io",
+            "--no-display-prompt", "--no-warmup"});
         if (use_metal) { arguments.emplace_back("-ngl"); arguments.emplace_back("99"); }
         std::vector<char*> argv;
         for (auto& argument : arguments) argv.push_back(argument.data());
@@ -281,18 +357,20 @@ bool generate_with_llama(Socket client, const fs::path& model, const std::string
 }
 #endif
 
-[[maybe_unused]] void serve_client(Socket client, NodeInfo node, fs::path model_directory, std::string llama_cli) {
+[[maybe_unused]] void serve_client(Socket client, NodeInfo node, fs::path model_directory,
+                                   std::string llama_cli, bool include_managed_model) {
     SocketGuard guard(client);
     if (!send_frame(client, Message::info, serialize_node(node))) return;
-    std::optional<fs::path> selected_model;
+    std::optional<ModelOption> selected_model;
     while (const auto frame = receive_frame(client)) {
         const auto& [kind, payload] = *frame;
         if (kind == Message::list_models) {
-            if (!send_frame(client, Message::models, model_names(scan_models(model_directory)))) return;
+            if (!send_frame(client, Message::models,
+                            model_names(available_models(model_directory, include_managed_model)))) return;
         } else if (kind == Message::select_model) {
             selected_model.reset();
-            for (const auto& path : scan_models(model_directory)) {
-                if (path.filename().string() == payload) selected_model = path;
+            for (const auto& model : available_models(model_directory, include_managed_model)) {
+                if (model.display_name == payload) selected_model = model;
             }
             if (!selected_model) {
                 if (!send_frame(client, Message::error, "The selected model is no longer available.")) return;
@@ -354,7 +432,26 @@ void run_worker() {
 #else
     const NodeInfo node = local_node_info();
     const fs::path models = std::getenv("MESHLLM_MODELS") ? std::getenv("MESHLLM_MODELS") : "models";
-    const std::string llama_cli = std::getenv("MESHLLM_LLAMA_CLI") ? std::getenv("MESHLLM_LLAMA_CLI") : "llama-cli";
+    const std::string llama_cli = find_llama_cli();
+    bool include_managed_model = false;
+    if (scan_models(models).empty()) {
+        std::cout << "\nNo local GGUF models were found in " << fs::absolute(models).string() << ".\n\n"
+                  << "MeshLLM can download its recommended starter model:\n"
+                  << "  Qwen3.5 0.8B, Q4_0 (Apache 2.0, approximately 600 MB)\n\n"
+                  << "It will be stored in llama.cpp's user cache. Download now? [y/N]: " << std::flush;
+        std::string answer;
+        if (!std::getline(std::cin, answer) || (answer != "y" && answer != "Y")) {
+            std::cout << "Worker startup cancelled. Add a .gguf file or accept the managed model.\n";
+            return;
+        }
+        std::cout << "\nDownloading and checking the model. This can take a few minutes...\n";
+        if (!download_recommended_model(llama_cli)) {
+            std::cout << "\nThe model download failed. Check the internet connection and available disk space.\n";
+            return;
+        }
+        include_managed_model = true;
+        std::cout << "\nModel is ready.\n";
+    }
     SocketGuard listener(::socket(AF_INET, SOCK_STREAM, 0));
     if (listener.value == kInvalidSocket) throw std::runtime_error("could not create worker socket");
     int reuse = 1;
@@ -372,11 +469,13 @@ void run_worker() {
               << "Node: " << node.name << '\n' << "Device: " << node.device << '\n'
               << "Backend: " << node.backend << '\n'
               << "Memory: " << (node.memory_bytes / (1024ull * 1024ull * 1024ull)) << " GB\n"
-              << "Models: " << fs::absolute(models).string() << " (" << scan_models(models).size() << " found)\n\n"
+              << "Models: " << available_models(models, include_managed_model).size() << " available\n\n"
               << "Device is now available on the local network.\n\nWaiting for connections...\n";
     for (;;) {
         const Socket client = accept(listener.value, nullptr, nullptr);
-        if (client != kInvalidSocket) std::thread(serve_client, client, node, models, llama_cli).detach();
+        if (client != kInvalidSocket) {
+            std::thread(serve_client, client, node, models, llama_cli, include_managed_model).detach();
+        }
     }
 #endif
 }
@@ -519,8 +618,10 @@ void find_devices() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        (void)argc;
+        g_executable_directory = executable_directory(argv[0]);
         initialize_sockets();
 #ifndef _WIN32
         signal(SIGPIPE, SIG_IGN);
