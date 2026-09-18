@@ -187,13 +187,13 @@ fs::path executable_directory(const char* argv0) {
 #ifdef __APPLE__
     std::uint32_t size = 0;
     _NSGetExecutablePath(nullptr, &size);
-    std::vector<char> path(size);
-    if (_NSGetExecutablePath(path.data(), &size) == 0) {
-        return fs::weakly_canonical(path.data(), error).parent_path();
+    std::vector<char> executable_path_buffer(size);
+    if (_NSGetExecutablePath(executable_path_buffer.data(), &size) == 0) {
+        return fs::weakly_canonical(executable_path_buffer.data(), error).parent_path();
     }
 #endif
-    const fs::path path = argv0 ? argv0 : "meshllm";
-    return fs::weakly_canonical(fs::absolute(path, error), error).parent_path();
+    const fs::path fallback_path = argv0 ? argv0 : "meshllm";
+    return fs::weakly_canonical(fs::absolute(fallback_path, error), error).parent_path();
 }
 
 [[maybe_unused]] std::string find_llama_cli() {
