@@ -24,7 +24,9 @@ constexpr Socket kInvalidSocket = INVALID_SOCKET;
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <netdb.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -174,6 +176,37 @@ std::string safe_field(std::string value) {
     std::replace(value.begin(), value.end(), '\t', ' ');
     std::replace(value.begin(), value.end(), '\n', ' ');
     return value;
+}
+
+std::vector<in_addr> discovery_addresses() {
+    std::vector<in_addr> result;
+    result.push_back({htonl(INADDR_BROADCAST)});
+    result.push_back({htonl(INADDR_LOOPBACK)});
+
+#ifndef _WIN32
+    // 255.255.255.255 is not forwarded consistently by all Wi-Fi access
+    // points. Send to each interface's directed broadcast as well, such as
+    // 192.168.0.255 for a 192.168.0.0/24 network.
+    ifaddrs* interfaces = nullptr;
+    if (getifaddrs(&interfaces) == 0) {
+        for (const ifaddrs* interface = interfaces; interface; interface = interface->ifa_next) {
+            if (!interface->ifa_addr || !interface->ifa_broadaddr ||
+                interface->ifa_addr->sa_family != AF_INET ||
+                !(interface->ifa_flags & IFF_UP) || !(interface->ifa_flags & IFF_BROADCAST)) continue;
+            const auto* broadcast = reinterpret_cast<const sockaddr_in*>(interface->ifa_broadaddr);
+            result.push_back(broadcast->sin_addr);
+        }
+        freeifaddrs(interfaces);
+    }
+#endif
+
+    std::sort(result.begin(), result.end(), [](const in_addr& left, const in_addr& right) {
+        return left.s_addr < right.s_addr;
+    });
+    result.erase(std::unique(result.begin(), result.end(), [](const in_addr& left, const in_addr& right) {
+        return left.s_addr == right.s_addr;
+    }), result.end());
+    return result;
 }
 
 std::string hostname() {
@@ -488,14 +521,11 @@ std::vector<WorkerInfo> discover_workers() {
     sockaddr_in destination{};
     destination.sin_family = AF_INET;
     destination.sin_port = htons(kDiscoveryPort);
-    destination.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    sendto(socket.value, kDiscover.data(), static_cast<int>(kDiscover.size()), 0,
-           reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
-    // Also probe localhost so the complete workflow can be used and tested on
-    // one Mac; some network stacks do not reflect limited broadcasts locally.
-    destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    sendto(socket.value, kDiscover.data(), static_cast<int>(kDiscover.size()), 0,
-           reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+    for (const in_addr address : discovery_addresses()) {
+        destination.sin_addr = address;
+        sendto(socket.value, kDiscover.data(), static_cast<int>(kDiscover.size()), 0,
+               reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+    }
 #ifdef _WIN32
     DWORD timeout = 400;
 #else
@@ -563,7 +593,10 @@ void chat_with_worker(const WorkerInfo& worker) {
     if (socket.value == kInvalidSocket) { std::cout << "Could not connect to " << worker.address << ".\n"; return; }
     const auto info = receive_frame(socket.value);
     if (!info || info->first != Message::info) { std::cout << "The device did not speak the MeshLLM protocol.\n"; return; }
-    std::cout << "\nConnected to " << worker.name << ".\n\nAvailable models:\n\n";
+    std::string connected_name = worker.name;
+    const auto info_fields = split(info->second, '\t');
+    if (info_fields.size() == 4 && !info_fields[0].empty()) connected_name = info_fields[0];
+    std::cout << "\nConnected to " << connected_name << ".\n\nAvailable models:\n\n";
     if (!send_frame(socket.value, Message::list_models)) return;
     const auto response = receive_frame(socket.value);
     if (!response || response->first != Message::models) return;
@@ -603,7 +636,16 @@ void find_devices() {
     const auto workers = discover_workers();
     if (workers.empty()) {
         std::cout << "\nNo devices found. Check that both computers are on the same LAN and allow UDP port "
-                  << kDiscoveryPort << ".\n"; return;
+                  << kDiscoveryPort << ".\n\n"
+                  << "Enter the Mac worker's IPv4 address to connect directly, or press Enter to return: ";
+        std::string address;
+        if (!std::getline(std::cin, address) || address.empty()) return;
+        WorkerInfo worker;
+        worker.name = address;
+        worker.address = address;
+        worker.port = kWorkerPort;
+        chat_with_worker(worker);
+        return;
     }
     std::cout << '\n';
     for (std::size_t i = 0; i < workers.size(); ++i) {

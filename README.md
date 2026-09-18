@@ -48,6 +48,12 @@ Run the program on the Mac and choose **Share this device**. Run it on another
 computer on the same LAN and choose **Find available devices**. UDP broadcast
 discovery must be permitted on port 39554 and TCP connections on port 39555.
 
+If discovery is blocked by the Wi-Fi network, MeshLLM offers a direct-IP
+fallback. Find the Mac's Wi-Fi address with `ipconfig getifaddr en0` and enter
+it on the controller. If that also fails, allow the `meshllm` executable through
+the macOS firewall and verify that neither device is using a guest network or
+an access point with client isolation enabled.
+
 ## v0 design and limitations
 
 Discovery is a single UDP broadcast/reply exchange; chat uses a tiny
