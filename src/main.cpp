@@ -318,12 +318,16 @@ std::string model_names(const std::vector<ModelOption>& models) {
     const pid_t child = fork();
     if (child == -1) return false;
     if (child == 0) {
-        // Download progress and errors remain on stderr. Only the one-token
-        // warm-up response is hidden from the worker's setup screen.
-        const int null_fd = open("/dev/null", O_WRONLY);
-        if (null_fd >= 0) dup2(null_fd, STDOUT_FILENO);
+        // Single-turn exits after the probe; simple I/O prevents llama.cpp
+        // reopening /dev/tty and bypassing stdout redirection. Keep diagnostics
+        // on stderr and detach stdin so setup cannot consume menu input.
+        const int null_fd = open("/dev/null", O_RDWR);
+        if (null_fd < 0) _exit(127);
+        if (dup2(null_fd, STDIN_FILENO) < 0 || dup2(null_fd, STDOUT_FILENO) < 0) _exit(127);
+        if (null_fd > STDERR_FILENO) close(null_fd);
         std::vector<std::string> arguments{executable, "-hf", std::string(kRecommendedModelRepo),
-            "-p", "Ready", "-n", "1", "--no-display-prompt", "--no-warmup", "--no-mmproj"};
+            "-p", "Ready", "-n", "1", "--no-display-prompt", "--no-warmup", "--no-mmproj",
+            "--single-turn", "--simple-io", "--no-show-timings", "-c", "4096"};
         std::vector<char*> argv;
         for (auto& argument : arguments) argv.push_back(argument.data());
         argv.push_back(nullptr);
@@ -345,12 +349,15 @@ bool generate_with_llama(Socket client, const ModelOption& model, const std::str
     }
     if (child == 0) {
         dup2(output_pipe[1], STDOUT_FILENO);
-        const int null_fd = open("/dev/null", O_WRONLY);
-        if (null_fd >= 0) dup2(null_fd, STDERR_FILENO);
+        const int null_fd = open("/dev/null", O_RDWR);
+        if (null_fd < 0) _exit(127);
+        if (dup2(null_fd, STDIN_FILENO) < 0 || dup2(null_fd, STDERR_FILENO) < 0) _exit(127);
+        if (null_fd > STDERR_FILENO) close(null_fd);
         close(output_pipe[0]); close(output_pipe[1]);
 
-        // llama-cli is invoked directly (never through a shell). Its stdout pipe
-        // naturally provides streaming chunks without coupling to llama.cpp APIs.
+        // Invoke directly, with one turn per subprocess. Without --single-turn,
+        // the CLI waits for terminal input instead of closing the output pipe,
+        // so the controller never receives its completion frame.
         std::vector<std::string> arguments{executable};
         if (model.from_hugging_face) {
             arguments.insert(arguments.end(), {"-hf", model.source, "--no-mmproj"});
@@ -358,7 +365,7 @@ bool generate_with_llama(Socket client, const ModelOption& model, const std::str
             arguments.insert(arguments.end(), {"-m", model.source});
         }
         arguments.insert(arguments.end(), {"-p", prompt, "-n", "512", "--simple-io",
-            "--no-display-prompt", "--no-warmup"});
+            "--no-display-prompt", "--no-warmup", "--single-turn", "--no-show-timings", "-c", "4096"});
         if (use_metal) { arguments.emplace_back("-ngl"); arguments.emplace_back("99"); }
         std::vector<char*> argv;
         for (auto& argument : arguments) argv.push_back(argument.data());
